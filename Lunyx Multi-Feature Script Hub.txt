@@ -1,0 +1,700 @@
+--[[
+    ================================================================
+    LUNYX UNIVERSAL SCRIPT HUB MENU (ROBLOX LUAU)
+    Features: Combat, Visuals, Movement, Player Utility, World, Config
+    Controls: Toggle UI with RightShift or Top-Right Button
+    ================================================================
+--]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+local Lighting = game:GetService("Lighting")
+local CoreGui = game:GetService("CoreGui")
+local TeleportService = game:GetService("TeleportService")
+local HttpService = game:GetService("HttpService")
+
+local LocalPlayer = Players.LocalPlayer
+local Camera = Workspace.CurrentCamera
+
+--// Global Hub State
+local State = {
+    -- Combat
+    AimbotEnabled = false,
+    AlwaysLock = false,
+    AimKeyHeld = false,
+    TeamCheck = true,
+    AimPart = "Head", -- Head, Torso, Root
+    AimStrength = 0.85,
+    FOVEnabled = true,
+    FOVRadius = 160,
+
+    -- Visuals
+    ESPEnabled = false,
+    TracersEnabled = false,
+    ChamsEnabled = false,
+    ShowDistance = true,
+    ShowHealth = true,
+
+    -- Movement
+    SpeedEnabled = false,
+    WalkSpeed = 32,
+    JumpPowerEnabled = false,
+    JumpPower = 100,
+    InfJump = false,
+    Noclip = false,
+    SpinEnabled = false,
+    SpinSpeed = 150,
+
+    -- Utility & World
+    Fullbright = false,
+    CameraFOV = 70,
+    AntiAFK = true,
+    LowGraphics = false,
+
+    -- UI Control
+    UIVisible = true,
+    ActiveTab = "Combat"
+}
+
+local DefaultLighting = {
+    Brightness = Lighting.Brightness,
+    ClockTime = Lighting.ClockTime,
+    GlobalShadows = Lighting.GlobalShadows,
+    Ambient = Lighting.Ambient
+}
+
+local TargetCache = {}
+local ESPCache = {}
+local ActiveTarget = nil
+
+-- Remove Previous Instances
+local OldGui = CoreGui:FindFirstChild("LunyxScriptHub")
+if OldGui then OldGui:Destroy() end
+
+pcall(function()
+    RunService:UnbindFromRenderStep("LunyxAimStep")
+    RunService:UnbindFromRenderStep("LunyxVisualsStep")
+    RunService:UnbindFromRenderStep("LunyxMoveStep")
+end)
+
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "LunyxScriptHub"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.IgnoreGuiInset = true
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+pcall(function() ScreenGui.Parent = CoreGui end)
+if not ScreenGui.Parent then ScreenGui.Parent = LocalPlayer:WaitForChild("PlayerGui") end
+
+--// Drawing API & Fallbacks
+local HasDrawing = (typeof(Drawing) == "table" and typeof(Drawing.new) == "function")
+
+local function NewLine()
+    if HasDrawing then
+        local ok, line = pcall(function()
+            local l = Drawing.new("Line")
+            l.Thickness = 1.5
+            l.Color = Color3.fromRGB(235, 65, 65)
+            l.Transparency = 0.85
+            l.Visible = false
+            return l
+        end)
+        if ok and line then return line, true end
+    end
+    local f = Instance.new("Frame")
+    f.AnchorPoint = Vector2.new(0, 0.5)
+    f.BackgroundColor3 = Color3.fromRGB(235, 65, 65)
+    f.BorderSizePixel = 0
+    f.Size = UDim2.fromOffset(0, 1.5)
+    f.Visible = false
+    f.Parent = ScreenGui
+    return f, false
+end
+
+local function SetLine(obj, isDraw, p1, p2, vis)
+    if not vis then obj.Visible = false return end
+    if isDraw then
+        obj.From = p1; obj.To = p2; obj.Visible = true
+    else
+        local delta = p2 - p1
+        local dist = delta.Magnitude
+        if dist <= 1 then obj.Visible = false return end
+        obj.Position = UDim2.fromOffset(p1.X, p1.Y)
+        obj.Size = UDim2.fromOffset(dist, 1.5)
+        obj.Rotation = math.deg(math.atan2(delta.Y, delta.X))
+        obj.Visible = true
+    end
+end
+
+-- FOV Visual Ring
+local FOVDrawing = nil
+local FOVFrame = nil
+if HasDrawing then
+    pcall(function()
+        local c = Drawing.new("Circle")
+        c.Thickness = 1.5
+        c.NumSides = 48
+        c.Radius = State.FOVRadius
+        c.Filled = false
+        c.Color = Color3.fromRGB(235, 65, 65)
+        c.Transparency = 0.85
+        c.Visible = false
+        FOVDrawing = c
+    end)
+end
+if not FOVDrawing then
+    FOVFrame = Instance.new("Frame")
+    FOVFrame.AnchorPoint = Vector2.new(0.5, 0.5)
+    FOVFrame.BackgroundTransparency = 1
+    FOVFrame.Size = UDim2.fromOffset(State.FOVRadius * 2, State.FOVRadius * 2)
+    FOVFrame.Visible = false
+    FOVFrame.Parent = ScreenGui
+    Instance.new("UICorner", FOVFrame).CornerRadius = UDim.new(1, 0)
+    local st = Instance.new("UIStroke", FOVFrame)
+    st.Color = Color3.fromRGB(235, 65, 65)
+    st.Thickness = 1.5
+end
+
+local function SyncFOV(center)
+    local vis = State.FOVEnabled and (State.AimbotEnabled or State.UIVisible)
+    if FOVDrawing then
+        FOVDrawing.Position = center
+        FOVDrawing.Radius = State.FOVRadius
+        FOVDrawing.Visible = vis
+    elseif FOVFrame then
+        FOVFrame.Position = UDim2.fromOffset(center.X, center.Y)
+        FOVFrame.Size = UDim2.fromOffset(State.FOVRadius * 2, State.FOVRadius * 2)
+        FOVFrame.Visible = vis
+    end
+end
+
+--// UI Construction
+local TogglePill = Instance.new("TextButton")
+TogglePill.Size = UDim2.new(0, 96, 0, 28)
+TogglePill.Position = UDim2.new(1, -108, 0, 14)
+TogglePill.BackgroundColor3 = Color3.fromRGB(16, 16, 22)
+TogglePill.Text = "LUNYX HUB"
+TogglePill.TextColor3 = Color3.fromRGB(235, 65, 65)
+TogglePill.Font = Enum.Font.GothamBold
+TogglePill.TextSize = 12
+TogglePill.Parent = ScreenGui
+Instance.new("UICorner", TogglePill).CornerRadius = UDim.new(0, 6)
+local PillStroke = Instance.new("UIStroke", TogglePill)
+PillStroke.Color = Color3.fromRGB(235, 65, 65)
+
+local Main = Instance.new("Frame")
+Main.Size = UDim2.new(0, 420, 0, 360)
+Main.Position = UDim2.new(0.5, -210, 0.5, -180)
+Main.BackgroundColor3 = Color3.fromRGB(14, 14, 18)
+Main.Active = true
+Main.Parent = ScreenGui
+Instance.new("UICorner", Main).CornerRadius = UDim.new(0, 8)
+local MainStroke = Instance.new("UIStroke", Main)
+MainStroke.Color = Color3.fromRGB(220, 50, 50)
+
+-- Header Dragging
+local Header = Instance.new("Frame")
+Header.Size = UDim2.new(1, 0, 0, 34)
+Header.BackgroundColor3 = Color3.fromRGB(22, 22, 28)
+Header.Parent = Main
+Instance.new("UICorner", Header).CornerRadius = UDim.new(0, 8)
+
+local Title = Instance.new("TextLabel")
+Title.Size = UDim2.new(1, -16, 1, 0)
+Title.Position = UDim2.new(0, 12, 0, 0)
+Title.BackgroundTransparency = 1
+Title.Text = "LUNYX SCRIPT HUB // MULTI-FUNCTION SYSTEM"
+Title.TextColor3 = Color3.fromRGB(240, 240, 245)
+Title.Font = Enum.Font.GothamBold
+Title.TextSize = 12
+Title.TextXAlignment = Enum.TextXAlignment.Left
+Title.Parent = Header
+
+local dragging, dragStart, startPos
+Header.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = true
+        dragStart = input.Position
+        startPos = Main.Position
+    end
+end)
+UserInputService.InputChanged:Connect(function(input)
+    if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+        local delta = input.Position - dragStart
+        Main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+    end
+end)
+UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = false
+    end
+end)
+
+-- Sidebar Tabs
+local Sidebar = Instance.new("Frame")
+Sidebar.Size = UDim2.new(0, 110, 1, -44)
+Sidebar.Position = UDim2.new(0, 8, 0, 38)
+Sidebar.BackgroundColor3 = Color3.fromRGB(18, 18, 24)
+Sidebar.Parent = Main
+Instance.new("UICorner", Sidebar).CornerRadius = UDim.new(0, 6)
+
+local SideLayout = Instance.new("UIListLayout")
+SideLayout.Padding = UDim.new(0, 4)
+SideLayout.Parent = Sidebar
+
+local ContentArea = Instance.new("Frame")
+ContentArea.Size = UDim2.new(1, -134, 1, -44)
+ContentArea.Position = UDim2.new(0, 124, 0, 38)
+ContentArea.BackgroundTransparency = 1
+ContentArea.Parent = Main
+
+local Pages = {}
+local TabButtons = {}
+
+local function CreateTab(name)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(1, 0, 0, 28)
+    btn.BackgroundColor3 = Color3.fromRGB(24, 24, 32)
+    btn.BorderSizePixel = 0
+    btn.Text = name
+    btn.Font = Enum.Font.GothamBold
+    btn.TextSize = 11
+    btn.TextColor3 = Color3.fromRGB(180, 180, 190)
+    btn.Parent = Sidebar
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 5)
+
+    local page = Instance.new("ScrollingFrame")
+    page.Name = name
+    page.Size = UDim2.new(1, 0, 1, 0)
+    page.BackgroundTransparency = 1
+    page.ScrollBarThickness = 3
+    page.Visible = false
+    page.Parent = ContentArea
+
+    local layout = Instance.new("UIListLayout")
+    layout.Padding = UDim.new(0, 6)
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.Parent = page
+
+    Pages[name] = page
+    TabButtons[name] = btn
+
+    btn.MouseButton1Click:Connect(function()
+        for k, p in pairs(Pages) do p.Visible = (k == name) end
+        for k, b in pairs(TabButtons) do
+            local active = (k == name)
+            b.BackgroundColor3 = active and Color3.fromRGB(220, 50, 50) or Color3.fromRGB(24, 24, 32)
+            b.TextColor3 = active and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(180, 180, 190)
+        end
+        State.ActiveTab = name
+    end)
+
+    return page
+end
+
+-- UI Components Builder
+local function AddToggle(parent, text, defaultVal, order, cb)
+    local Row = Instance.new("Frame")
+    Row.Size = UDim2.new(1, -6, 0, 28)
+    Row.BackgroundColor3 = Color3.fromRGB(22, 22, 28)
+    Row.LayoutOrder = order
+    Row.Parent = parent
+    Instance.new("UICorner", Row).CornerRadius = UDim.new(0, 6)
+
+    local Label = Instance.new("TextLabel")
+    Label.Size = UDim2.new(1, -56, 1, 0)
+    Label.Position = UDim2.new(0, 8, 0, 0)
+    Label.BackgroundTransparency = 1
+    Label.Text = text
+    Label.TextColor3 = Color3.fromRGB(225, 225, 232)
+    Label.Font = Enum.Font.GothamMedium
+    Label.TextSize = 11
+    Label.TextXAlignment = Enum.TextXAlignment.Left
+    Label.Parent = Row
+
+    local Btn = Instance.new("TextButton")
+    Btn.Size = UDim2.new(0, 42, 0, 18)
+    Btn.Position = UDim2.new(1, -48, 0.5, -9)
+    Btn.Font = Enum.Font.GothamBold
+    Btn.TextSize = 10
+    Btn.Parent = Row
+    Instance.new("UICorner", Btn).CornerRadius = UDim.new(0, 4)
+
+    local on = defaultVal
+    local function Render()
+        Btn.Text = on and "ON" or "OFF"
+        Btn.BackgroundColor3 = on and Color3.fromRGB(220, 50, 50) or Color3.fromRGB(45, 45, 55)
+        Btn.TextColor3 = on and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(170, 170, 180)
+    end
+    Render()
+    Btn.MouseButton1Click:Connect(function()
+        on = not on
+        Render()
+        cb(on)
+    end)
+end
+
+local function AddSlider(parent, text, initVal, minV, maxV, step, isFloat, order, cb)
+    local Row = Instance.new("Frame")
+    Row.Size = UDim2.new(1, -6, 0, 28)
+    Row.BackgroundColor3 = Color3.fromRGB(18, 18, 24)
+    Row.LayoutOrder = order
+    Row.Parent = parent
+    Instance.new("UICorner", Row).CornerRadius = UDim.new(0, 6)
+
+    local Label = Instance.new("TextLabel")
+    Label.Size = UDim2.new(0, 110, 1, 0)
+    Label.Position = UDim2.new(0, 8, 0, 0)
+    Label.BackgroundTransparency = 1
+    Label.Text = text
+    Label.TextColor3 = Color3.fromRGB(185, 185, 198)
+    Label.Font = Enum.Font.Gotham
+    Label.TextSize = 11
+    Label.TextXAlignment = Enum.TextXAlignment.Left
+    Label.Parent = Row
+
+    local cur = initVal
+    local function Fmt(v) return isFloat and string.format("%.2f", v) or tostring(math.floor(v)) end
+
+    local Minus = Instance.new("TextButton")
+    Minus.Size = UDim2.new(0, 22, 0, 18)
+    Minus.Position = UDim2.new(1, -104, 0.5, -9)
+    Minus.BackgroundColor3 = Color3.fromRGB(35, 35, 45)
+    Minus.Text = "-"
+    Minus.TextColor3 = Color3.fromRGB(240, 240, 245)
+    Minus.Font = Enum.Font.GothamBold
+    Minus.TextSize = 12
+    Minus.Parent = Row
+    Instance.new("UICorner", Minus).CornerRadius = UDim.new(0, 4)
+
+    local Box = Instance.new("TextBox")
+    Box.Size = UDim2.new(0, 44, 0, 18)
+    Box.Position = UDim2.new(1, -78, 0.5, -9)
+    Box.BackgroundColor3 = Color3.fromRGB(28, 28, 36)
+    Box.Text = Fmt(cur)
+    Box.TextColor3 = Color3.fromRGB(235, 65, 65)
+    Box.Font = Enum.Font.GothamBold
+    Box.TextSize = 10
+    Box.ClearTextOnFocus = false
+    Box.Parent = Row
+    Instance.new("UICorner", Box).CornerRadius = UDim.new(0, 4)
+
+    local Plus = Instance.new("TextButton")
+    Plus.Size = UDim2.new(0, 22, 0, 18)
+    Plus.Position = UDim2.new(1, -30, 0.5, -9)
+    Plus.BackgroundColor3 = Color3.fromRGB(35, 35, 45)
+    Plus.Text = "+"
+    Plus.TextColor3 = Color3.fromRGB(240, 240, 245)
+    Plus.Font = Enum.Font.GothamBold
+    Plus.TextSize = 12
+    Plus.Parent = Row
+    Instance.new("UICorner", Plus).CornerRadius = UDim.new(0, 4)
+
+    local function Apply(v)
+        v = math.clamp(v, minV, maxV)
+        cur = isFloat and (math.floor(v * 100 + 0.5) / 100) or math.floor(v)
+        Box.Text = Fmt(cur)
+        cb(cur)
+    end
+    Minus.MouseButton1Click:Connect(function() Apply(cur - step) end)
+    Plus.MouseButton1Click:Connect(function() Apply(cur + step) end)
+    Box.FocusLost:Connect(function()
+        local n = tonumber(Box.Text)
+        if n then Apply(n) else Box.Text = Fmt(cur) end
+    end)
+end
+
+local function AddButton(parent, text, order, cb)
+    local Btn = Instance.new("TextButton")
+    Btn.Size = UDim2.new(1, -6, 0, 28)
+    Btn.BackgroundColor3 = Color3.fromRGB(32, 32, 42)
+    Btn.LayoutOrder = order
+    Btn.Text = text
+    Btn.TextColor3 = Color3.fromRGB(240, 240, 245)
+    Btn.Font = Enum.Font.GothamBold
+    Btn.TextSize = 11
+    Btn.Parent = parent
+    Instance.new("UICorner", Btn).CornerRadius = UDim.new(0, 6)
+    Btn.MouseButton1Click:Connect(cb)
+end
+
+-- Create Pages
+local CombatPage = CreateTab("Combat")
+local VisualsPage = CreateTab("Visuals")
+local MovementPage = CreateTab("Movement")
+local UtilityPage = CreateTab("Utility")
+local WorldPage = CreateTab("World")
+local ConfigPage = CreateTab("Settings")
+
+-- Initial Selection
+TabButtons["Combat"].BackgroundColor3 = Color3.fromRGB(220, 50, 50)
+TabButtons["Combat"].TextColor3 = Color3.fromRGB(255, 255, 255)
+Pages["Combat"].Visible = true
+
+--// Populate Features
+-- 1. COMBAT
+AddToggle(CombatPage, "Aimbot Master Toggle", State.AimbotEnabled, 1, function(v) State.AimbotEnabled = v end)
+AddToggle(CombatPage, "Always Lock (No Key Hold)", State.AlwaysLock, 2, function(v) State.AlwaysLock = v end)
+AddToggle(CombatPage, "Team Check", State.TeamCheck, 3, function(v) State.TeamCheck = v end)
+AddSlider(CombatPage, "Aim Smoothness", State.AimStrength, 0.1, 1.0, 0.05, true, 4, function(v) State.AimStrength = v end)
+AddSlider(CombatPage, "FOV Circle Radius", State.FOVRadius, 40, 600, 20, false, 5, function(v) State.FOVRadius = v end)
+
+-- 2. VISUALS
+AddToggle(VisualsPage, "Player ESP Box/Tag", State.ESPEnabled, 1, function(v) State.ESPEnabled = v end)
+AddToggle(VisualsPage, "Tracer Lines", State.TracersEnabled, 2, function(v) State.TracersEnabled = v end)
+AddToggle(VisualsPage, "Player Chams Overlay", State.ChamsEnabled, 3, function(v) State.ChamsEnabled = v end)
+AddToggle(VisualsPage, "Draw FOV Ring", State.FOVEnabled, 4, function(v) State.FOVEnabled = v end)
+
+-- 3. MOVEMENT
+AddToggle(MovementPage, "Speed Hack", State.SpeedEnabled, 1, function(v)
+    State.SpeedEnabled = v
+    local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+    if hum and not v then hum.WalkSpeed = 16 end
+end)
+AddSlider(MovementPage, "WalkSpeed Value", State.WalkSpeed, 16, 300, 10, false, 2, function(v) State.WalkSpeed = v end)
+AddToggle(MovementPage, "JumpPower Hack", State.JumpPowerEnabled, 3, function(v)
+    State.JumpPowerEnabled = v
+    local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+    if hum and not v then hum.JumpPower = 50 end
+end)
+AddSlider(MovementPage, "JumpPower Value", State.JumpPower, 50, 300, 10, false, 4, function(v) State.JumpPower = v end)
+AddToggle(MovementPage, "Infinite Jump", State.InfJump, 5, function(v) State.InfJump = v end)
+AddToggle(MovementPage, "Noclip", State.Noclip, 6, function(v) State.Noclip = v end)
+AddToggle(MovementPage, "SpinBot", State.SpinEnabled, 7, function(v)
+    State.SpinEnabled = v
+    local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+    if hum and not v then hum.AutoRotate = true end
+end)
+AddSlider(MovementPage, "Spin Speed", State.SpinSpeed, 30, 500, 30, false, 8, function(v) State.SpinSpeed = v end)
+
+-- 4. UTILITY
+AddToggle(UtilityPage, "Fullbright Lighting", State.Fullbright, 1, function(v)
+    State.Fullbright = v
+    if not v then
+        Lighting.Brightness = DefaultLighting.Brightness
+        Lighting.ClockTime = DefaultLighting.ClockTime
+        Lighting.GlobalShadows = DefaultLighting.GlobalShadows
+        Lighting.Ambient = DefaultLighting.Ambient
+    end
+end)
+AddSlider(UtilityPage, "Camera FOV Zoom", State.CameraFOV, 40, 120, 5, false, 2, function(v)
+    State.CameraFOV = v
+    Camera.FieldOfView = v
+end)
+AddButton(UtilityPage, "Respawn Character", 3, function()
+    local char = LocalPlayer.Character
+    if char and char:FindFirstChildOfClass("Humanoid") then
+        char:FindFirstChildOfClass("Humanoid").Health = 0
+    end
+end)
+AddButton(UtilityPage, "Give BTools", 4, function()
+    local t1 = Instance.new("HopperBin", LocalPlayer:FindFirstChildOfClass("Backpack")) t1.BinType = 4
+    local t2 = Instance.new("HopperBin", LocalPlayer:FindFirstChildOfClass("Backpack")) t2.BinType = 3
+    local t3 = Instance.new("HopperBin", LocalPlayer:FindFirstChildOfClass("Backpack")) t3.BinType = 2
+end)
+
+-- 5. WORLD
+AddButton(WorldPage, "Rejoin Same Server", 1, function()
+    TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer)
+end)
+AddButton(WorldPage, "Server Hop (Random)", 2, function()
+    TeleportService:Teleport(game.PlaceId, LocalPlayer)
+end)
+AddToggle(WorldPage, "Anti-Lag Mode", State.LowGraphics, 3, function(v)
+    State.LowGraphics = v
+    if v then
+        for _, inst in ipairs(Workspace:GetDescendants()) do
+            if inst:IsA("BasePart") then inst.Material = Enum.Material.SmoothPlastic end
+            if inst:IsA("ParticleEmitter") or inst:IsA("Trail") then inst.Enabled = false end
+        end
+    end
+end)
+
+-- 6. SETTINGS
+AddButton(ConfigPage, "Save Settings to File", 1, function()
+    if writefile then
+        pcall(function() writefile("LunyxConfig.json", HttpService:JSONEncode(State)) end)
+    end
+end)
+AddButton(ConfigPage, "Load Settings from File", 2, function()
+    if readfile and isfile and isfile("LunyxConfig.json") then
+        pcall(function()
+            local decoded = HttpService:JSONDecode(readfile("LunyxConfig.json"))
+            for k, v in pairs(decoded) do State[k] = v end
+        end)
+    end
+end)
+
+--// Core Systems Engine
+local function GetAimTarget()
+    local vp = Camera.ViewportSize
+    local center = Vector2.new(vp.X * 0.5, vp.Y * 0.5)
+    local bestPart = nil
+    local bestDist = State.FOVRadius
+
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer and plr.Character then
+            local sameTeam = State.TeamCheck and plr.Team and LocalPlayer.Team and (plr.Team == LocalPlayer.Team)
+            if not sameTeam then
+                local hum = plr.Character:FindFirstChildOfClass("Humanoid")
+                local targetPart = plr.Character:FindFirstChild(State.AimPart) or plr.Character:FindFirstChild("Head")
+                if hum and hum.Health > 0 and targetPart then
+                    local sp, onScreen = Camera:WorldToViewportPoint(targetPart.Position)
+                    if onScreen and sp.Z > 0 then
+                        local d = (Vector2.new(sp.X, sp.Y) - center).Magnitude
+                        if d <= bestDist then
+                            bestDist = d
+                            bestPart = targetPart
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return bestPart
+end
+
+-- Inputs & Toggles
+local function ToggleUI()
+    State.UIVisible = not State.UIVisible
+    Main.Visible = State.UIVisible
+end
+TogglePill.MouseButton1Click:Connect(ToggleUI)
+
+UserInputService.InputBegan:Connect(function(input, gp)
+    if gp then return end
+    if input.KeyCode == Enum.KeyCode.RightShift then
+        ToggleUI()
+    elseif input.UserInputType == Enum.UserInputType.MouseButton2 then
+        State.AimKeyHeld = true
+    end
+end)
+UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton2 then
+        State.AimKeyHeld = false
+    end
+end)
+
+UserInputService.JumpRequest:Connect(function()
+    if State.InfJump then
+        local char = LocalPlayer.Character
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        if hum then hum:ChangeState(Enum.HumanoidStateType.Jumping) end
+    end
+end)
+
+-- Anti AFK Connection
+LocalPlayer.Idled:Connect(function()
+    if State.AntiAFK then
+        local vu = game:GetService("VirtualUser")
+        vu:CaptureController()
+        vu:ClickButton2(Vector2.new())
+    end
+end)
+
+-- Main Render Loops
+RunService:BindToRenderStep("LunyxAimStep", Enum.RenderPriority.Camera.Value + 1, function()
+    local vp = Camera.ViewportSize
+    SyncFOV(Vector2.new(vp.X * 0.5, vp.Y * 0.5))
+
+    if State.AimbotEnabled then
+        ActiveTarget = GetAimTarget()
+        if ActiveTarget and (State.AimKeyHeld or State.AlwaysLock) then
+            local goal = CFrame.lookAt(Camera.CFrame.Position, ActiveTarget.Position)
+            local alpha = math.clamp(State.AimStrength, 0.1, 1)
+            Camera.CFrame = (alpha >= 0.99) and goal or Camera.CFrame:Lerp(goal, alpha)
+        end
+    end
+end)
+
+RunService:BindToRenderStep("LunyxMoveStep", Enum.RenderPriority.Last.Value, function(dt)
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+
+    if hum then
+        if State.SpeedEnabled then hum.WalkSpeed = State.WalkSpeed end
+        if State.JumpPowerEnabled then hum.JumpPower = State.JumpPower end
+        if State.SpinEnabled then hum.AutoRotate = false end
+    end
+
+    if root and State.SpinEnabled then
+        root.CFrame = root.CFrame * CFrame.Angles(0, State.SpinSpeed * dt, 0)
+    end
+
+    if State.Noclip and char then
+        for _, p in ipairs(char:GetChildren()) do
+            if p:IsA("BasePart") then p.CanCollide = false end
+        end
+    end
+
+    if State.Fullbright then
+        Lighting.Brightness = 2
+        Lighting.ClockTime = 14
+        Lighting.GlobalShadows = false
+        Lighting.Ambient = Color3.fromRGB(255, 255, 255)
+    end
+end)
+
+RunService:BindToRenderStep("LunyxVisualsStep", Enum.RenderPriority.Last.Value, function()
+    local vp = Camera.ViewportSize
+    local origin = Vector2.new(vp.X * 0.5, vp.Y)
+
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer and plr.Character then
+            local char = plr.Character
+            local root = char:FindFirstChild("HumanoidRootPart")
+            local hum = char:FindFirstChildOfClass("Humanoid")
+            local e = ESPCache[plr]
+
+            if not e then
+                local hl = Instance.new("Highlight")
+                hl.FillColor = Color3.fromRGB(235, 50, 50)
+                hl.OutlineColor = Color3.fromRGB(255, 255, 255)
+                hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+                hl.Parent = char
+
+                local bb = Instance.new("BillboardGui")
+                bb.Size = UDim2.new(0, 120, 0, 22)
+                bb.StudsOffset = Vector3.new(0, 2.3, 0)
+                bb.AlwaysOnTop = true
+                bb.Adornee = root
+                bb.Parent = root
+
+                local lbl = Instance.new("TextLabel")
+                lbl.Size = UDim2.new(1, 0, 1, 0)
+                lbl.BackgroundTransparency = 1
+                lbl.TextColor3 = Color3.fromRGB(255, 95, 95)
+                lbl.Font = Enum.Font.GothamBold
+                lbl.TextSize = 11
+                lbl.Parent = bb
+
+                local tracer, isDraw = NewLine()
+                e = { hl = hl, bb = bb, lbl = lbl, tracer = tracer, isDraw = isDraw }
+                ESPCache[plr] = e
+            end
+
+            e.hl.Enabled = State.ChamsEnabled
+            e.bb.Enabled = State.ESPEnabled
+
+            if State.ESPEnabled and root and hum then
+                local myRoot = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+                local dist = myRoot and math.floor((myRoot.Position - root.Position).Magnitude) or 0
+                e.lbl.Text = string.format("%s [%d HP | %dm]", plr.DisplayName, math.floor(hum.Health), dist)
+            end
+
+            if State.TracersEnabled and root then
+                local sp, onScreen = Camera:WorldToViewportPoint(root.Position)
+                if onScreen and sp.Z > 0 then
+                    SetLine(e.tracer, e.isDraw, origin, Vector2.new(sp.X, sp.Y), true)
+                else
+                    SetLine(e.tracer, e.isDraw, Vector2.zero, Vector2.zero, false)
+                end
+            else
+                SetLine(e.tracer, e.isDraw, Vector2.zero, Vector2.zero, false)
+            end
+        end
+    end
+end)
